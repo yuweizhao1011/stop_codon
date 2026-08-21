@@ -1,0 +1,165 @@
+#####0. download fastq sequences
+#0. 如果服务器上没有，下载软件
+ /disks/node3_RAID6_120TB/wangtingting/asoft/sra
+wget --output-document sratoolkit.tar.gz https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-centos_linux64.tar.gz
+tar -vxzf sratoolkit.tar.gz
+
+#1. 下载好以后，加入环境路径，#每次运行以下两行
+echo 'export export PATH=$PATH:/disks/node3_RAID6_120TB/wangtingting/asoft/sra/sratoolkit.3.2.0-centos_linux64/bin' >> ~/.bash_profile
+source ~/.bash_profile
+
+#2. 批量下载，自己先准备txt文件下次直接运行为
+cd /disks/node3_RAID6_120TB/zhaoyuwei/meta/xvlie
+nohup prefetch --option-file /disks/node3_RAID6_120TB/zhaoyuwei/meta/xvlie/135.txt &
+
+#3. 批量解压SRR文件
+output_dir="./fastq"
+for sra_file in ./data/*/*.sra; do
+    echo "Processing $sra_file"
+    fastq-dump --split-3 -O "$output_dir" "$sra_file"
+done
+
+#4.1 修改*_1.fastq为*_R1.fastq
+for file in fastq/*_1.fastq; do
+    new_file="${file/_1.fastq/_R1.fastq}"
+    mv "$file" "$new_file"
+done
+
+#4.2 修改*_2.fastq为*_R2.fastq
+for file in fastq/*_2.fastq; do
+    new_file="${file/_2.fastq/_R2.fastq}"
+    mv "$file" "$new_file"
+done
+
+
+
+
+
+
+#####1. form the ASV table for each study
+#0. 单端跑这个，这是把所有R1合并到一起，之后运行去引物这一步
+cat ./fastq/*.fastq > ./temp/merged0.fq
+
+#1. 校正序列方向
+#1.1 检查序列方向：输出的merged1.fq文件仅含有正向的，反向的进行了反向互补。未定向的丢弃了。
+usearch -orient temp/merged0.fq -db /disks/node3_RAID6_120TB/zhaoyuwei/nifh/RG_cexvliangbugou/db/uniques.fasta -fastqout temp/merged1.fq -tabbedout temp/report.txt
+
+#1.2 找回被软件丢弃的序列
+python ../undet1.py
+
+#1.3 检查序列数，不能统计@数，因为最后一行的质量评估含有@
+diff_count=$(wc -l ./temp/undet.fq | awk '{print $1/4}')
+# 计算理论差异数
+total0=$(wc -l ./temp/merged0.fq | awk '{print $1/4}')
+total1=$(wc -l ./temp/merged1.fq | awk '{print $1/4}')
+expected_diff=$((total0 - total1))
+# 输出验证结果
+echo "实际差异记录数: $diff_count"
+echo "理论差异记录数: $expected_diff"
+if [ $diff_count -eq $expected_diff ]; then
+    echo "✅ 验证通过"
+else
+    echo "❌ 数据异常，请检查ID匹配逻辑"
+fi
+
+#1.4 合并merged1.fq与undet.fq
+cat ./temp/merged1.fq ./temp/undet.fq > ./temp/merged.fq
+
+#2. 去引物：每篇文章分别去除对应碱基数的引物，以1篇文章为例：
+usearch -fastx_truncate temp/merged.fq -stripleft 20 -stripright 20 -fastqout temp/filtered1.fq
+
+#3. 质控前先运行这一步，看中位数，最大值是多少，每篇文章cut的参数不同，以1篇文章为例：
+fastx-utils info temp/filtered1.fq
+usearch --fastq_eestats2 temp/filtered1.fq -output result/eestats2.txt -length_cutoffs 150,400,10
+usearch -fastq_filter temp/filtered1.fq -fastq_trunclen 220 -fastq_maxee_rate 0.01 -fastaout temp/filtered.fa
+
+#4. 去冗余
+usearch -fastx_uniques temp/filtered.fa -fastaout temp/uniques.fa -sizeout -relabel Uniq
+usearch -unoise3 temp/uniques.fa -zotus temp/zotus_0.fa -minsize 2
+
+#5. 构建可操作分类单元（OTU）表格:将测序数据比对到OTU或ZOTU（零半径OTU，类似ASV）上，统计每个样本中的OTU出现次数
+nohup usearch -otutab temp/merged.fq -otus temp/zotus_0.fa -otutabout result/otutab.txt -mapout temp/map.txt --threads 60 &
+
+
+
+
+
+
+#####2. prodigal
+#1. prodigal
+prodigal -i temp/zotus_0.fa -a temp/translated_proteins.faa -f gff -o temp/genes.gff
+
+#2. 构建仅突变的tab
+#2.1 将每个temp/translated_proteins.faa文件中带*（终止密码子）的序列及其注释信息提取出来，保存到p*/stop_condon文件夹中，命名为p*_stopcodon_translated_proteins.faa
+python ../stopcodon_translated_proteins.py
+
+#2.2 提取含终止密码子序列的Zotu名字
+grep "^>Zotu" stop_codon/p111_stopcodon_translated_proteins.faa | cut -d ' ' -f 1 | sed 's/^>//; s/_[0-9]*$//' > stop_codon/stopcodon_otu_name.txt
+
+#2.3 匹配到原始otutab
+head -n 1 result/otutab.txt > stop_codon/stopcodon_otutab.txt
+###从otutab.txt文件中精确提取涉及到的Zotu的整行信息
+while IFS= read -r zotu; do
+    # 构建精确匹配的正则表达式
+    pattern="^${zotu}([[:space:]]|$)"
+    grep -E "$pattern" result/otutab.txt >> stop_codon/stopcodon_otutab.txt
+done < stop_codon/stopcodon_otu_name.txt
+
+
+
+
+
+
+
+#####3. calculate the mutation frequency of stop codon
+#1. 计算每个样本的突变序列总数，即stopcodon_otutab.txt每列的和
+python ../stopcodon_total_xvlie.py
+
+#2. 计算每个样本的序列总数(包含突变和未突变), 即result/otutab.txt每列的和，二者相除
+python ../stopcodon_rate.py
+
+#定义输入和输出文件路径
+input_file="./stop_codon/stopcodon_rate.txt"
+output_file="./stop_codon/stopcodon_rate_clean.txt"
+
+# 检查输入文件是否存在
+if [ ! -f "$input_file" ]; then
+    echo "错误：输入文件不存在 - $input_file"
+    exit 1
+fi
+
+# 提取第一行和最后三行
+first_line=$(head -n 1 "$input_file")
+last_three_lines=$(tail -n 3 "$input_file")
+
+# 将第一行和最后三行组合
+combined_lines="$first_line
+$last_three_lines"
+
+# 转置数据，使用制表符作为分隔符
+transposed=$(echo "$combined_lines" | awk -F '\t' '{
+    for (i = 1; i <= NF; i++) {
+        a[NR, i] = $i
+    }
+    max_col = (NF > max_col ? NF : max_col)
+}
+END {
+    for (i = 1; i <= max_col; i++) {
+        for (j = 1; j <= NR; j++) {
+            printf "%s", a[j, i]
+            if (j < NR) {
+                printf "\t"
+            }
+        }
+        print ""
+    }
+}')
+
+# 保存转置后的数据到输出文件
+echo "$transposed" > "$output_file"
+
+echo "成功生成文件：$output_file"
+
+#3.0 合并全部研究
+cd ..
+python3 merged_stopcodonrate.py
