@@ -38,7 +38,7 @@ done
 
 #####1. form the ASV table for each study
 #0. 单端跑这个，这是把所有R1合并到一起，之后运行去引物这一步
-cat ./fastq/*.fastq > ./temp/merged0.fq
+cat ./fastq/*R1.fastq > ./temp/merged0.fq
 
 #1. 校正序列方向
 #1.1 检查序列方向：输出的merged1.fq文件仅含有正向的，反向的进行了反向互补。未定向的丢弃了。
